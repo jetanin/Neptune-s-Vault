@@ -63,9 +63,9 @@ const uint8_t BUZZER_LEDC_CHANNEL = 2; // channel ของ ledc สำหรั
 const uint8_t SERVO_LOCKED = 0;
 const uint8_t SERVO_OPEN = 90;
 Servo lockServo;
-uint8_t currentServoAngle = SERVO_LOCKED;
+uint8_t currentServoAngle = SERVO_OPEN;
 
-void setServoAngle(uint8_t angle)
+void writeServo(uint8_t angle)
 {
   currentServoAngle = angle;
   lockServo.write(angle);
@@ -75,13 +75,13 @@ void setServoAngle(uint8_t angle)
 bool currentRedLed = false;
 bool currentGreenLed = false;
 
-void setRedLed(bool on)
+void writeRed(bool on)
 {
   currentRedLed = on;
   digitalWrite(RED_PIN, on ? HIGH : LOW);
 }
 
-void setGreenLed(bool on)
+void writeGreen(bool on)
 {
   currentGreenLed = on;
   digitalWrite(GREEN_PIN, on ? HIGH : LOW);
@@ -112,12 +112,15 @@ const uint8_t ANSWER_KEY[NUM_GROUPS] = {
     /*20 */ 12,
 };
 
-// ---------------- สถานะเกม ----------------
+// ---------------- สถานะเกม (จำกัดให้ตอบผิดได้สูงสุด 3 ครั้ง) ----------------
+const uint8_t MAX_ATTEMPTS = 3;
+
 enum GameState
 {
   SETUP,
   PLAYING,
-  SOLVED
+  SOLVED,
+  FAILED
 };
 GameState state = SETUP;
 
@@ -143,7 +146,8 @@ enum BlinkMode
   BLINK_SETUP_ALT,
   BLINK_ERROR_RED,
   BLINK_WRONG_RED,
-  BLINK_SOLVED_GREEN
+  BLINK_SOLVED_GREEN,
+  BLINK_FAILED_RED
 };
 BlinkMode blinkMode = BLINK_SETUP_ALT;
 unsigned long blinkLastToggle = 0;
@@ -191,17 +195,12 @@ void updateTune()
     if (tuneIdx < tuneLen)
     {
       uint16_t f = activeTune[tuneIdx].freq;
-      if (f == 0)
-        ledcWriteTone(BUZZER_LEDC_CHANNEL, 0);
-      else
-        ledcWriteTone(BUZZER_LEDC_CHANNEL, f);
       setBuzzerTone(f);
       tuneNextAt = millis() + activeTune[tuneIdx].durMs;
       tuneIdx++;
     }
     else
     {
-      ledcWriteTone(BUZZER_LEDC_CHANNEL, 0);
       setBuzzerTone(0);
       activeTune = nullptr;
     }
@@ -221,10 +220,11 @@ void enterSetup()
 {
   state = SETUP;
   currentGroup = 0;
+  expectedCode = 0;
   wrongCount = 0;
-  setServoAngle(SERVO_LOCKED);
-  setRedLed(false);
-  setGreenLed(false);
+  writeServo(SERVO_OPEN); // ในระหว่าง setup ให้ unlock (เปิดกลอน 90°)
+  writeRed(false);
+  writeGreen(false);
   setBlink(BLINK_SETUP_ALT);
 }
 
@@ -237,13 +237,14 @@ void trySetGroup(uint8_t group)
     wrongCount = 0;
     roundStartMs = millis();
     state = PLAYING;
-    setServoAngle(SERVO_LOCKED);
+    writeServo(SERVO_LOCKED); // หลังจากเริ่มกลุ่ม เข้าสู่ stage LOCKED (ล็อคกลอน 0°)
     setBlink(BLINK_OFF);
-    setRedLed(false);
-    setGreenLed(false);
+    writeRed(false);
+    writeGreen(false);
     startTune(TUNE_CONFIRM, 1);
 
-    Serial.printf("เริ่มกลุ่ม %u -> LOCKED พร้อมให้กรอกรหัส\n", currentGroup);
+    Serial.printf("เริ่มกลุ่ม %u (เฉลย = %u) -> LOCKED กลอนล็อคพร้อมเริ่มเล่น (ตอบได้สูงสุด %u ครั้ง)\n",
+                  currentGroup, expectedCode, MAX_ATTEMPTS);
   }
   else
   {
@@ -255,6 +256,9 @@ void trySetGroup(uint8_t group)
 
 void submitGuess(uint8_t code)
 {
+  if (state != PLAYING)
+    return; // ตอบได้เฉพาะตอน PLAYING เท่านั้น
+
   unsigned long elapsed = millis() - roundStartMs;
 
   if (code == expectedCode)
@@ -262,8 +266,9 @@ void submitGuess(uint8_t code)
     state = SOLVED;
     solvedElapsedMs = elapsed;
     setBlink(BLINK_SOLVED_GREEN);
-    setRedLed(false);
-    setServoAngle(SERVO_OPEN);
+    writeRed(false);
+    writeGreen(true);
+    writeServo(SERVO_OPEN);
     startTune(TUNE_CORRECT, 3);
 
     Serial.printf("ถูกต้อง! กลุ่ม %u ใช้เวลา %lu วิ ผิด %u ครั้ง\n",
@@ -272,9 +277,21 @@ void submitGuess(uint8_t code)
   else
   {
     wrongCount++;
-    setBlink(BLINK_WRONG_RED);
-    startTune(TUNE_WRONG, 1);
-    Serial.printf("ผิด (ครั้งที่ %u) รหัสที่กรอก = %u\n", wrongCount, code);
+    if (wrongCount >= MAX_ATTEMPTS)
+    {
+      state = FAILED;
+      writeServo(SERVO_LOCKED);
+      setBlink(BLINK_FAILED_RED);
+      startTune(TUNE_ERROR, 3);
+      Serial.printf("ผิดครบ %u ครั้ง! กลุ่ม %u ตกรอบ (FAILED) รหัสล่าสุดที่กรอก = %u\n",
+                    MAX_ATTEMPTS, currentGroup, code);
+    }
+    else
+    {
+      setBlink(BLINK_WRONG_RED);
+      startTune(TUNE_WRONG, 1);
+      Serial.printf("ผิด (ครั้งที่ %u/%u) รหัสที่กรอก = %u\n", wrongCount, MAX_ATTEMPTS, code);
+    }
   }
 }
 
@@ -347,30 +364,36 @@ void updateBlink()
   case BLINK_OFF:
     break;
   case BLINK_SOLVED_GREEN:
-    setGreenLed(true);
+    writeGreen(true);
+    writeRed(false);
+    break;
+  case BLINK_FAILED_RED:
+    writeRed(true);
+    writeGreen(false);
     break;
   case BLINK_SETUP_ALT:
     if (millis() - blinkLastToggle >= interval)
     {
       blinkLastToggle = millis();
       blinkPhase = !blinkPhase;
-      setRedLed(blinkPhase);
-      setGreenLed(!blinkPhase);
+      writeRed(blinkPhase);
+      writeGreen(!blinkPhase);
     }
     break;
   case BLINK_WRONG_RED:
   case BLINK_ERROR_RED:
     if (blinkPulsesLeft == 0)
     {
-      setRedLed(false);
-      blinkMode = (state == SETUP) ? BLINK_SETUP_ALT : BLINK_OFF;
+      writeRed(false);
+      blinkMode = (state == SETUP) ? BLINK_SETUP_ALT : (state == FAILED) ? BLINK_FAILED_RED
+                                                                         : BLINK_OFF;
       break;
     }
     if (millis() - blinkLastToggle >= interval)
     {
       blinkLastToggle = millis();
       blinkPhase = !blinkPhase;
-      setRedLed(blinkPhase);
+      writeRed(blinkPhase);
       if (!blinkPhase)
         blinkPulsesLeft--;
     }
@@ -379,113 +402,183 @@ void updateBlink()
 }
 
 // ---------------- หน้าเว็บ (ฝัง HTML/CSS/JS ไว้ในตัว ไม่ต้องมีอินเทอร์เน็ต) ----------------
-// ---------------- หน้าเว็บ (ฝัง HTML/CSS/JS ไว้ในตัว ไม่ต้องมีอินเทอร์เน็ต) ----------------
 const char PAGE_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html lang="th"><head><meta charset="utf-8">
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Safe Challenge - หลังบ้าน</title>
+<title>Safe Challenge - Admin Console</title>
 <style>
-  body{font-family:Tahoma,sans-serif;background:#181b20;color:#e6e8ec;
-       display:flex;justify-content:center;padding:16px;margin:0}
-  .card{background:#23272f;border-radius:14px;padding:20px;max-width:440px;width:100%;box-shadow:0 8px 24px rgba(0,0,0,0.4)}
-  h1{font-size:19px;margin:0 0 14px;text-align:center;color:#61dafb}
-  .badges-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
-  .badge{display:inline-block;padding:6px 14px;border-radius:20px;font-weight:bold;font-size:13px}
-  .b-setup{background:#4b5563;color:#fff}
-  .b-playing{background:#dc2626;color:#fff}
-  .b-solved{background:#16a34a;color:#fff}
-  .b-locked{background:#7f1d1d;color:#fca5a5;border:1px solid #dc2626}
-  .b-open{background:#14532d;color:#86efac;border:1px solid #16a34a}
-  
-  .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
-  .stat-card{background:#1a1d24;padding:8px 12px;border-radius:8px}
-  .stat-label{font-size:12px;color:#9ca3af}
-  .stat-val{font-size:16px;font-weight:bold;color:#93c5fd;margin-top:2px}
-  
-  .section-title{font-size:13px;color:#93c5fd;margin:12px 0 8px;font-weight:bold;
-                 display:flex;align-items:center;gap:6px;border-bottom:1px solid #374151;padding-bottom:4px}
-  .hw-card{background:#1a1d24;border-radius:10px;padding:12px;margin-bottom:12px;border:1px solid #2e3440}
+  :root{
+    --bg-void:#020611;
+    --bg-deep:#04102b;
+    --bg-mid:#082252;
+    --panel:rgba(9,25,58,0.72);
+    --panel-border:rgba(56,189,248,0.28);
+    --cyan:#38bdf8;
+    --cyan-bright:#7dd3fc;
+    --cyan-dim:#0ea5c9;
+    --indigo:#3b5bdb;
+    --text:#e6f1ff;
+    --text-mute:#8ca3c9;
+    --ok:#2dd4bf;
+    --ok-glow:#5eead4;
+    --warn:#fbbf24;
+    --bad:#f43f5e;
+    --bad-glow:#fb7185;
+  }
+  *{box-sizing:border-box}
+  body{font-family:'Segoe UI',Tahoma,sans-serif;
+       background:
+         radial-gradient(ellipse 900px 600px at 50% -10%, var(--bg-mid) 0%, transparent 60%),
+         radial-gradient(ellipse 700px 500px at 90% 110%, #0a1a3f 0%, transparent 55%),
+         linear-gradient(160deg, var(--bg-deep) 0%, var(--bg-void) 100%);
+       background-attachment:fixed;
+       color:var(--text);
+       display:flex;justify-content:center;padding:16px;margin:0;min-height:100vh}
+  .card{background:var(--panel);border:1px solid var(--panel-border);
+        border-radius:16px;padding:20px;max-width:450px;width:100%;
+        backdrop-filter:blur(10px);
+        box-shadow:0 0 0 1px rgba(56,189,248,0.06) inset,
+                   0 20px 60px rgba(0,0,0,0.55),
+                   0 0 40px rgba(56,189,248,0.08)}
+  h1{font-size:19px;margin:0 0 14px;text-align:center;color:var(--cyan-bright);
+     letter-spacing:.3px;text-shadow:0 0 18px rgba(56,189,248,0.45)}
+  h1::before{content:"\2646  "}
+  .badges-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px}
+  .badge{display:inline-block;padding:6px 14px;border-radius:20px;font-weight:bold;font-size:12px;
+         border:1px solid transparent;white-space:nowrap}
+  .b-setup{background:#1e293b;color:#cbd5e1;border-color:#334155}
+  .b-playing{background:rgba(59,91,219,0.22);color:#93c5fd;border-color:var(--indigo);
+             box-shadow:0 0 12px rgba(59,91,219,0.35)}
+  .b-solved{background:rgba(45,212,191,0.16);color:var(--ok-glow);border-color:var(--ok);
+            box-shadow:0 0 14px rgba(45,212,191,0.4)}
+  .b-failed{background:rgba(244,63,94,0.16);color:var(--bad-glow);border-color:var(--bad);
+            box-shadow:0 0 14px rgba(244,63,94,0.4)}
+  .b-locked{background:rgba(244,63,94,0.14);color:#fca5b5;border-color:#7f1d3d}
+  .b-open{background:rgba(45,212,191,0.16);color:var(--ok-glow);border-color:var(--ok)}
+
+  .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  .stat-card{background:rgba(4,16,43,0.65);padding:8px 12px;border-radius:10px;
+             border:1px solid rgba(56,189,248,0.12)}
+  .stat-label{font-size:11px;color:var(--text-mute);letter-spacing:.2px}
+  .stat-val{font-size:15px;font-weight:bold;color:var(--cyan-bright);margin-top:2px}
+
+  /* Answer Key Box */
+  .key-card{background:linear-gradient(160deg, rgba(14,165,201,0.10), rgba(4,16,43,0.7));
+            border:1px solid var(--cyan-dim);border-radius:12px;padding:12px;margin-bottom:12px;
+            box-shadow:0 0 20px rgba(14,165,201,0.12) inset}
+  .key-header{font-size:13px;color:var(--cyan);font-weight:bold;display:flex;
+              justify-content:space-between;margin-bottom:4px}
+  .key-main{font-size:16px;color:#f0f9ff}
+  .key-main b{color:var(--cyan-bright);font-size:18px;text-shadow:0 0 10px rgba(125,211,252,0.5)}
+  .key-sub{font-size:12px;color:var(--text-mute);margin-top:4px}
+
+  /* Live Hardware Monitor */
+  .section-title{font-size:12px;color:var(--cyan-bright);margin:12px 0 8px;font-weight:bold;
+                 letter-spacing:.4px;text-transform:uppercase;
+                 display:flex;align-items:center;gap:6px;
+                 border-bottom:1px solid rgba(56,189,248,0.18);padding-bottom:4px}
+  .hw-card{background:rgba(4,16,43,0.6);border-radius:12px;padding:12px;margin-bottom:12px;
+           border:1px solid rgba(56,189,248,0.15)}
   .hw-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
   .hw-row:last-child{margin-bottom:0}
-  .hw-name{font-size:13px;color:#d1d5db}
-  
+  .hw-name{font-size:13px;color:#b9cbe8}
+
   /* Switches 5-bit (SW5 MSB on left, SW1 LSB on right) */
   .sw-group{display:flex;gap:4px;direction:rtl}
   .sw-pill{padding:4px 7px;border-radius:6px;font-size:11px;font-family:Consolas,monospace;
-           background:#374151;color:#9ca3af;text-align:center;transition:all 0.15s;direction:ltr}
-  .sw-pill.on{background:#0284c7;color:#fff;font-weight:bold;box-shadow:0 0 8px rgba(2,132,199,0.6)}
-  
+           background:#101c37;color:#64748b;text-align:center;transition:all 0.15s;
+           direction:ltr;border:1px solid rgba(100,116,139,0.3)}
+  .sw-pill.on{background:var(--cyan-dim);color:#03151f;font-weight:bold;
+              box-shadow:0 0 10px rgba(56,189,248,0.7);border-color:var(--cyan-bright)}
+
   /* Confirm button pill */
-  .pill{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:bold;transition:all 0.15s}
-  .pill-idle{background:#374151;color:#9ca3af}
-  .pill-pressed{background:#f59e0b;color:#000;box-shadow:0 0 10px #f59e0b}
-  
+  .pill{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:bold;transition:all 0.15s;
+        border:1px solid transparent}
+  .pill-idle{background:#101c37;color:#64748b;border-color:rgba(100,116,139,0.3)}
+  .pill-pressed{background:var(--warn);color:#1a1200;box-shadow:0 0 12px rgba(251,191,36,0.7)}
+
   /* LEDs */
   .leds-wrap{display:flex;gap:14px;align-items:center}
-  .led-item{display:flex;align-items:center;gap:6px;font-size:12px}
+  .led-item{display:flex;align-items:center;gap:6px;font-size:12px;color:#b9cbe8}
   .led-dot{width:14px;height:14px;border-radius:50%;display:inline-block;transition:all 0.15s}
-  .led-r-off{background:#451a1a;border:1px solid #7f1d1d}
-  .led-r-on{background:#ef4444;box-shadow:0 0 12px #ef4444;border:1px solid #fca5a5}
-  .led-g-off{background:#143823;border:1px solid #14532d}
-  .led-g-on{background:#22c55e;box-shadow:0 0 12px #22c55e;border:1px solid #86efac}
-  
+  .led-r-off{background:#2a0f16;border:1px solid #7f1d3d}
+  .led-r-on{background:var(--bad);box-shadow:0 0 12px var(--bad);border:1px solid var(--bad-glow)}
+  .led-g-off{background:#0b2420;border:1px solid #115e51}
+  .led-g-on{background:var(--ok);box-shadow:0 0 12px var(--ok);border:1px solid var(--ok-glow)}
+
   /* Servo status */
   .servo-status{font-weight:bold;font-size:13px}
-  
+
   /* Action buttons */
   .row{display:flex;gap:8px;margin-bottom:10px}
-  input[type=number]{flex:1;padding:10px;border-radius:8px;border:1px solid #4b5563;background:#1a1d24;color:#fff;font-size:15px}
-  button{padding:10px 16px;border:none;border-radius:8px;font-size:14px;cursor:pointer;transition:opacity 0.2s}
-  button:active{opacity:0.8}
-  .btn-start{background:#22c55e;color:#052e16;font-weight:bold}
-  .btn-reset{background:#dc2626;color:#fff;font-weight:bold;width:100%}
-  #msg{min-height:20px;color:#f59e0b;font-size:13px;margin:8px 0 0;text-align:center}
+  input[type=number]{flex:1;padding:10px;border-radius:8px;border:1px solid rgba(56,189,248,0.3);
+                      background:#04102b;color:var(--text);font-size:15px}
+  input[type=number]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 3px rgba(56,189,248,0.2)}
+  button{padding:10px 16px;border:none;border-radius:8px;font-size:14px;cursor:pointer;
+         transition:opacity .2s, transform .1s}
+  button:active{opacity:.8;transform:scale(0.98)}
+  .btn-start{background:linear-gradient(135deg, var(--cyan) 0%, var(--cyan-dim) 100%);
+             color:#03151f;font-weight:bold;box-shadow:0 0 14px rgba(56,189,248,0.4)}
+  .btn-reset{background:linear-gradient(135deg, var(--bad) 0%, #b91c3c 100%);
+             color:#fff;font-weight:bold;width:100%;box-shadow:0 0 14px rgba(244,63,94,0.3)}
+  #msg{min-height:22px;font-size:13px;margin:8px 0 0;text-align:center}
 </style></head><body>
 <div class="card">
-  <h1>Safe Challenge - แผงควบคุม</h1>
+  <h1>Neptune's Vault Challenge - Console</h1>
   <div class="badges-row">
     <span id="badge" class="badge b-setup">SETUP</span>
-    <span id="servoBadge" class="badge b-locked">🔒 SERVO: LOCKED (0°)</span>
+    <span id="servoBadge" class="badge b-open">🔓 SERVO: UNLOCKED (90°)</span>
   </div>
 
   <div class="stats-grid">
     <div class="stat-card">
-      <div class="stat-label">กลุ่มปัจจุบัน</div>
+      <div class="stat-label">Current Group</div>
       <div id="group" class="stat-val">-</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">ผิดกี่ครั้ง</div>
+      <div class="stat-label">Incorrect Attempts (Max 3)</div>
       <div id="wrong" class="stat-val">-</div>
     </div>
     <div class="stat-card" style="grid-column:span 2">
-      <div class="stat-label">เวลาที่ใช้</div>
+      <div class="stat-label">Elapsed Time</div>
       <div id="elapsed" class="stat-val">-</div>
     </div>
   </div>
 
-  <div class="section-title">⚡ สถานะฮาร์ดแวร์ (Live Hardware)</div>
+  <!-- Answer Key Section -->
+  <div class="key-card">
+    <div class="key-header">
+      <span>🔑 Group Answer Key</span>
+      <span id="keyGroupTitle"></span>
+    </div>
+    <div id="keyBox" class="key-main">- No Group Selected -</div>
+    <div id="keySub" class="key-sub">Please enter group number (1-20) and click Start Group</div>
+  </div>
+
+  <!-- Live Hardware Monitor -->
+  <div class="section-title">⚡ Live Hardware Monitor</div>
   <div class="hw-card">
     <div class="hw-row">
-      <span class="hw-name">สวิตช์ 5 บิต:</span>
+      <span class="hw-name">5-bit Switches:</span>
       <div class="sw-group">
-        <span id="sw4" class="sw-pill">SW5: 0</span>
-        <span id="sw3" class="sw-pill">SW4: 0</span>
-        <span id="sw2" class="sw-pill">SW3: 0</span>
-        <span id="sw1" class="sw-pill">SW2: 0</span>
-        <span id="sw0" class="sw-pill">SW1: 0</span>
+      <span id="sw0" class="sw-pill">SW1: 0</span>
+      <span id="sw1" class="sw-pill">SW2: 0</span>
+      <span id="sw2" class="sw-pill">SW3: 0</span>
+      <span id="sw3" class="sw-pill">SW4: 0</span>
+      <span id="sw4" class="sw-pill">SW5: 0</span>
       </div>
     </div>
-    <div style="font-size:12px;color:#9ca3af;text-align:right;margin-bottom:8px">
-      ค่า: <b id="swDec" style="color:#67e8f9">0</b> (Binary: <span id="swBin" style="font-family:monospace;color:#67e8f9">00000</span>)
+    <div style="font-size:12px;color:var(--text-mute);text-align:right;margin-bottom:8px">
+      Current Value: <b id="swDec" style="color:var(--cyan-bright)">0</b> (Binary: <span id="swBin" style="font-family:monospace;color:var(--cyan-bright)">00000</span>)
     </div>
 
     <div class="hw-row">
-      <span class="hw-name">ปุ่มยืนยัน (Confirm):</span>
-      <span id="btnConfirm" class="pill pill-idle">ปล่อย</span>
+      <span class="hw-name">Confirm Button:</span>
+      <span id="btnConfirm" class="pill pill-idle">IDLE</span>
     </div>
 
     <div class="hw-row">
-      <span class="hw-name">ไฟ LED:</span>
+      <span class="hw-name">Status LEDs:</span>
       <div class="leds-wrap">
         <div class="led-item">
           <span id="ledRedDot" class="led-dot led-r-off"></span> <span>RED</span>
@@ -497,16 +590,16 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
     </div>
 
     <div class="hw-row">
-      <span class="hw-name">เซอร์โว (กลอน):</span>
-      <span id="servoText" class="servo-status" style="color:#f87171">LOCKED (0°)</span>
+      <span class="hw-name">Door Lock (Servo):</span>
+      <span id="servoText" class="servo-status" style="color:#4ade80">UNLOCKED (90°)</span>
     </div>
   </div>
 
   <div class="row" style="margin-top:14px">
-    <input type="number" id="groupInput" min="1" max="20" placeholder="เลขกลุ่ม 1-20">
-    <button class="btn-start" onclick="startGroup()">เริ่ม/เปลี่ยนกลุ่ม</button>
+    <input type="number" id="groupInput" min="1" max="20" placeholder="Group (1-20)">
+    <button class="btn-start" onclick="startGroup()">Start Group</button>
   </div>
-  <button class="btn-reset" onclick="doReset()">รีเซ็ตกลับ SETUP</button>
+  <button class="btn-reset" onclick="doReset()">Reset to SETUP</button>
   <p id="msg"></p>
 </div>
 
@@ -518,19 +611,63 @@ function refresh(){
   inFlight = true;
   fetch('/status').then(r=>r.json()).then(d=>{
     inFlight = false;
-    const badge=document.getElementById('badge');
-    badge.textContent=d.state;
-    badge.className='badge ' + (d.state==='SETUP'?'b-setup':d.state==='PLAYING'?'b-playing':'b-solved');
-    document.getElementById('group').textContent = d.group>0 ? ('กลุ่ม ' + d.group) : '-';
-    document.getElementById('wrong').textContent = d.state==='SETUP' ? '-' : (d.wrong + ' ครั้ง');
-    document.getElementById('elapsed').textContent = d.state==='SETUP' ? '-' : fmt(d.elapsed);
 
-    // Switches
+    // Game State Badge
+    const badge = document.getElementById('badge');
+    if (d.state === 'FAILED') {
+      badge.textContent = 'FAILED';
+      badge.className = 'badge b-failed';
+    } else if (d.state === 'SOLVED') {
+      badge.textContent = 'SOLVED';
+      badge.className = 'badge b-solved';
+    } else if (d.state === 'PLAYING') {
+      badge.textContent = 'PLAYING';
+      badge.className = 'badge b-playing';
+    } else {
+      badge.textContent = 'SETUP';
+      badge.className = 'badge b-setup';
+    }
+
+    document.getElementById('group').textContent = d.group > 0 ? ('Group ' + d.group) : '-';
+
+    // Wrong attempts (Max 3)
+    const wrongEl = document.getElementById('wrong');
+    if (d.state === 'SETUP') {
+      wrongEl.textContent = '-';
+    } else {
+      const remain = Math.max(0, 3 - d.wrong);
+      wrongEl.innerHTML = d.wrong + ' / 3 <span style="font-size:12px;color:' +
+        (remain === 0 ? '#ef4444' : remain === 1 ? '#f59e0b' : '#10b981') +
+        '">(' + remain + ' left)</span>';
+    }
+
+    document.getElementById('elapsed').textContent = d.state === 'SETUP' ? '-' : fmt(d.elapsed);
+
+    // Answer Key
+    const keyBox = document.getElementById('keyBox');
+    const keySub = document.getElementById('keySub');
+    const keyGroupTitle = document.getElementById('keyGroupTitle');
+    if (d.group > 0 && d.expected !== undefined) {
+      keyGroupTitle.textContent = '[Group ' + d.group + ']';
+      const expBin = d.expected.toString(2).padStart(5, '0');
+      let onSw = [];
+      for (let i = 0; i < 5; i++) {
+        if ((d.expected >> i) & 1) onSw.push('SW' + (i + 1));
+      }
+      keyBox.innerHTML = 'Target Code: <b>' + d.expected + '</b> (Binary: <span style="font-family:monospace;color:#38bdf8">' + expBin + '</span>)';
+      keySub.textContent = onSw.length > 0 ? ('Required Switches (ON): ' + onSw.join(', ')) : 'All switches OFF (0)';
+    } else {
+      keyGroupTitle.textContent = '';
+      keyBox.textContent = '- No Group Selected -';
+      keySub.textContent = 'Please enter group number (1-20) and click Start Group';
+    }
+
+    // 5-bit Switches
     if (d.switches) {
-      for(let i=0; i<5; i++){
-        const el = document.getElementById('sw'+i);
+      for (let i = 0; i < 5; i++) {
+        const el = document.getElementById('sw' + i);
         const val = d.switches[i];
-        el.textContent = 'SW' + (i+1) + ':' + val;
+        el.textContent = 'SW' + (i + 1) + ':' + val;
         el.className = 'sw-pill ' + (val ? 'on' : '');
       }
     }
@@ -538,13 +675,13 @@ function refresh(){
     document.getElementById('swDec').textContent = sVal;
     document.getElementById('swBin').textContent = sVal.toString(2).padStart(5, '0');
 
-    // Confirm button
+    // Confirm Button
     const btnC = document.getElementById('btnConfirm');
     if (d.confirm_btn) {
-      btnC.textContent = 'กดอยู่ (PRESSED)';
+      btnC.textContent = 'PRESSED';
       btnC.className = 'pill pill-pressed';
     } else {
-      btnC.textContent = 'ปล่อย (IDLE)';
+      btnC.textContent = 'IDLE';
       btnC.className = 'pill pill-idle';
     }
 
@@ -554,34 +691,60 @@ function refresh(){
     const gDot = document.getElementById('ledGreenDot');
     gDot.className = 'led-dot ' + (d.led_green ? 'led-g-on' : 'led-g-off');
 
-    // Servo
+    // Door Lock (Servo)
     const sBadge = document.getElementById('servoBadge');
     const sText = document.getElementById('servoText');
     const isLocked = (d.servo_angle === 0 || d.servo_status === 'LOCKED');
     if (isLocked) {
-      sBadge.textContent = '🔒 LOCKED (' + (d.servo_angle||0) + '°)';
+      sBadge.textContent = '🔒 LOCKED (' + (d.servo_angle || 0) + '°)';
       sBadge.className = 'badge b-locked';
-      sText.textContent = 'LOCKED (' + (d.servo_angle||0) + '°)';
+      sText.textContent = 'LOCKED (' + (d.servo_angle || 0) + '°)';
       sText.style.color = '#f87171';
     } else {
-      sBadge.textContent = '🔓 OPEN (' + (d.servo_angle||90) + '°)';
+      sBadge.textContent = '🔓 UNLOCKED (' + (d.servo_angle || 90) + '°)';
       sBadge.className = 'badge b-open';
-      sText.textContent = 'OPEN (' + (d.servo_angle||90) + '°)';
+      sText.textContent = 'UNLOCKED (' + (d.servo_angle || 90) + '°)';
       sText.style.color = '#4ade80';
+    }
+
+    // Status Messages
+    const msg = document.getElementById('msg');
+    if (d.state === 'FAILED') {
+      msg.innerHTML = '<span style="color:#ef4444;font-weight:bold;">❌ 3 incorrect attempts reached! (Click Reset to retry)</span>';
+    } else if (d.state === 'SOLVED') {
+      msg.innerHTML = '<span style="color:#22c55e;font-weight:bold;">🎉 Safe Solved & Unlocked!</span>';
+    } else if (!msg.getAttribute('data-temp')) {
+      msg.textContent = '';
     }
   }).catch(()=>{ inFlight = false; });
 }
+
 function startGroup(){
   const g = document.getElementById('groupInput').value;
   const msg = document.getElementById('msg');
-  fetch('/start',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-                  body:'group='+encodeURIComponent(g)})
-    .then(r=>r.json()).then(d=>{ msg.textContent = d.ok ? '' : 'เลขกลุ่มไม่ถูกต้อง (1-20)'; refresh(); });
+  msg.setAttribute('data-temp', '1');
+  fetch('/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'group=' + encodeURIComponent(g)
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (!d.ok) {
+      msg.innerHTML = '<span style="color:#f59e0b">Invalid group number (must be 1-20)</span>';
+    } else {
+      msg.textContent = '';
+      msg.removeAttribute('data-temp');
+    }
+    refresh();
+  });
 }
+
 function doReset(){
-  fetch('/reset',{method:'POST'}).then(refresh);
+  fetch('/reset', {method: 'POST'}).then(refresh);
 }
-setInterval(refresh, 500);
+
+setInterval(refresh, 300);
 refresh();
 </script></body></html>
 )HTML";
@@ -599,31 +762,46 @@ void handleStatus()
   else if (state == SOLVED)
     elapsedSec = solvedElapsedMs / 1000;
 
-  const char *stateStr = (state == SETUP) ? "SETUP" : (state == PLAYING) ? "PLAYING"
-                                                                         : "SOLVED";
+  const char *stateStr = (state == SETUP)     ? "SETUP"
+                         : (state == PLAYING) ? "PLAYING"
+                         : (state == SOLVED)  ? "SOLVED"
+                                              : "FAILED";
 
-  uint8_t swCode = readSwitchCode();
+  // อ่านสถานะสวิตช์ทั้ง 5 ตัวสดๆ จากขา GPIO
+  uint8_t swCode = 0;
   uint8_t sw[5];
   for (uint8_t i = 0; i < 5; i++)
   {
-    sw[i] = (digitalRead(SW_PIN[i]) == LOW) ? 1 : 0;
+    bool isPressed = (digitalRead(SW_PIN[i]) == LOW);
+    sw[i] = isPressed ? 1 : 0;
+    if (isPressed)
+      swCode |= (1 << i);
   }
 
+  // อ่านปุ่มยืนยันสดๆ (กด = LOW)
   bool confirmPressed = (digitalRead(CONFIRM_PIN) == LOW);
-  const char *servoStr = (currentServoAngle == SERVO_OPEN) ? "OPEN" : "LOCKED";
 
-  char buf[360];
+  // ไฟ LED และ เซอร์โว
+  bool ledRed = currentRedLed;
+  bool ledGreen = currentGreenLed;
+  uint8_t servoAngle = currentServoAngle;
+  const char *servoStr = (servoAngle == SERVO_OPEN) ? "UNLOCKED" : "LOCKED";
+
+  // เฉลยของกลุ่มปัจจุบัน
+  uint8_t expCode = (currentGroup >= 1 && currentGroup <= NUM_GROUPS) ? ANSWER_KEY[currentGroup - 1] : 0;
+
+  char buf[380];
   snprintf(buf, sizeof(buf),
-           "{\"state\":\"%s\",\"group\":%u,\"wrong\":%u,\"elapsed\":%lu,"
-           "\"switches\":[%u,%u,%u,%u,%u],\"switch_val\":%u,"
+           "{\"state\":\"%s\",\"group\":%u,\"wrong\":%u,\"max_wrong\":%u,\"elapsed\":%lu,"
+           "\"expected\":%u,\"switches\":[%u,%u,%u,%u,%u],\"switch_val\":%u,"
            "\"confirm_btn\":%s,\"led_red\":%s,\"led_green\":%s,"
            "\"servo_angle\":%u,\"servo_status\":\"%s\"}",
-           stateStr, currentGroup, wrongCount, elapsedSec,
-           sw[0], sw[1], sw[2], sw[3], sw[4], swCode,
+           stateStr, currentGroup, wrongCount, MAX_ATTEMPTS, elapsedSec,
+           expCode, sw[0], sw[1], sw[2], sw[3], sw[4], swCode,
            confirmPressed ? "true" : "false",
-           currentRedLed ? "true" : "false",
-           currentGreenLed ? "true" : "false",
-           currentServoAngle, servoStr);
+           ledRed ? "true" : "false",
+           ledGreen ? "true" : "false",
+           servoAngle, servoStr);
   server.send(200, "application/json", buf);
 }
 
@@ -651,8 +829,8 @@ void setup()
   pinMode(CONFIRM_PIN, INPUT_PULLUP);
   pinMode(RED_PIN, OUTPUT);
   pinMode(GREEN_PIN, OUTPUT);
-  setRedLed(false);
-  setGreenLed(false);
+  writeRed(false);
+  writeGreen(false);
 
 #if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
   ledcAttach(BUZZER_PIN, 2000, 8);
@@ -663,7 +841,7 @@ void setup()
 
   lockServo.setPeriodHertz(50);
   lockServo.attach(SERVO_PIN, 500, 2400);
-  setServoAngle(SERVO_LOCKED);
+  writeServo(SERVO_OPEN);
 
   enterSetup();
 
