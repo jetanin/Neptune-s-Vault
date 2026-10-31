@@ -1,65 +1,70 @@
 /*
   Safe Challenge - ESP32 (Arduino framework) + Access Point
   ==========================================================
-  ทีมงานสั่งงาน "จากหลังบ้าน" ผ่านเว็บเพจในตัว ESP32 เอง:
-    - ESP32 ปล่อย WiFi ของตัวเอง (Access Point) ไม่ต้องมีอินเทอร์เน็ต
-    - ทีมงานต่อ WiFi นี้จากมือถือ/โน้ตบุ๊ก แล้วเปิดเบราว์เซอร์ไปที่ IP ของ ESP32
-      (ค่าเริ่มต้นของ Access Point คือ 192.168.4.1)
-    - หน้าเว็บ: กรอกเลขกลุ่ม (1-20) กดเริ่ม / ดูสถานะสด (LOCKED, กำลังเล่น, ผิดกี่ครั้ง,
-      เวลาที่ใช้) / ปุ่มรีเซ็ตกลับ SETUP
+  Staff manage the game through a web page hosted directly on the ESP32:
+    - The ESP32 broadcasts its own WiFi access point; no internet is required.
+    - Staff connect a phone or laptop to this WiFi and open the ESP32 IP in a browser.
+      (The default access point IP is 192.168.4.1)
+    - Web page: enter a group (1-20), start the round, view live status (LOCKED, playing,
+      incorrect attempts, elapsed time), or reset to SETUP.
 
-  ฮาร์ดแวร์ (เหมือนเวอร์ชัน Arduino เดิม):
-    - 5x สวิตช์ on/off      -> ผู้เข้าร่วมกรอกรหัส (bit0..bit4)
-                                ใช้เป็นสำรองตั้งเลขกลุ่มได้ด้วยถ้าไม่สะดวกใช้เว็บ
-    - 1x push switch        -> ปุ่มยืนยัน (กดสั้น = ยืนยัน, กดค้าง >=2วิ = รีเซ็ต)
+  Hardware (same as the original Arduino version):
+    - 5x on/off switches    -> Players enter the code (bit0..bit4).
+                                Also used to select a group without the web interface.
+    - 1x push switch        -> Confirm (short press = confirm, hold >=2 seconds = reset)
     - 1x red LED, 1x green LED
-    - 1x buzzer (passive แนะนำ ใช้ ledc สร้างเสียงได้หลายความถี่)
+    - 1x buzzer (passive recommended; LEDC generates tones at different frequencies)
     - 1x servo
 
-  ทำไมเลือก Arduino framework (ไม่ใช่ ESP-IDF):
-    งานนี้ต้องการ WebServer + Servo + digitalRead/millis ธรรมดา ซึ่ง Arduino core
-    ของ ESP32 มี WebServer.h และไลบรารี ESP32Servo ให้ใช้ได้ทันที โค้ดสั้น อ่านง่าย
-    ต่อยอดจากเวอร์ชัน Nano/Uno เดิมได้เกือบทั้งหมด ส่วน ESP-IDF ต้องเขียน HTTP server
-    (esp_http_server) และคุม PWM/servo เองทั้งหมดด้วย low-level API ซึ่งซับซ้อนกว่า
-    มากโดยไม่ได้ประโยชน์เพิ่มสำหรับโปรเจกต์ขนาดนี้ จึงแนะนำ Arduino framework
+  Why use the Arduino framework instead of ESP-IDF:
+    This project needs WebServer, Servo, and basic digitalRead/millis functions. The Arduino core
+    for ESP32 provides WebServer.h and ESP32Servo for concise, readable code.
+    Most of the original Nano/Uno code can be reused. ESP-IDF requires an HTTP server
+    (esp_http_server) and manual PWM/servo control through low-level APIs, adding complexity
+    without benefits for a project of this size, so the Arduino framework is recommended.
 
-  การต่อขา (เลี่ยง strapping pin ของ ESP32: GPIO0,2,5,12,15 และเลี่ยง GPIO34-39
-  เพราะเป็น input-only ไม่มี internal pull-up ให้ใช้กับสวิตช์):
+  Wiring (avoid ESP32 strapping pins GPIO0,2,5,12,15 and GPIO34-39,
+  which are input-only and lack internal pull-ups for switches):
     SW1(bit0) -> GPIO13      SW4(bit3) -> GPIO26
     SW2(bit1) -> GPIO14      SW5(bit4) -> GPIO25
     SW3(bit2) -> GPIO27      CONFIRM   -> GPIO33
     RED LED   -> GPIO32      GREEN LED -> GPIO21
-    BUZZER    -> GPIO19      SERVO     -> GPIO18
-  สวิตช์/ปุ่มทุกตัวต่อขาหนึ่งเข้าพินที่กำหนด อีกขาลง GND (โค้ดใช้ INPUT_PULLUP
-  จึงไม่ต้องมีตัวต้านทานภายนอก) กด/on แล้วจะอ่านได้ LOW
+    BUZZER    -> GPIO18      SERVO     -> GPIO19
+  Connect each switch/button between its assigned GPIO and GND. The code uses INPUT_PULLUP,
+  so no external pull-up resistors are needed. Pressed/ON reads LOW.
 
-  ติดตั้ง/อัปโหลดด้วย PlatformIO:
+  Build/upload with PlatformIO:
     pio run -t upload
-    pio device monitor          (ดู IP ของ Access Point และ log สถานะ)
+    pio device monitor          (View the access point IP and status logs)
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESP32Servo.h>
+#include "src/player_page.h"
 
 // ---------------- Access Point ----------------
 const char *AP_SSID = "SafeChallenge";
-const char *AP_PASS = "safe12345"; // ต้อง >= 8 ตัวอักษรสำหรับ WPA2
+const char *AP_PASS = "safe12345"; // Must contain at least 8 characters for WPA2
 
 WebServer server(80);
 
-// ---------------- ขา ----------------
+// ---------------- Pin assignments ----------------
 const uint8_t SW_PIN[5] = {13, 14, 27, 26, 25}; // bit0..bit4
 const uint8_t CONFIRM_PIN = 33;
 const uint8_t RED_PIN = 32;
 const uint8_t GREEN_PIN = 21;
-const uint8_t BUZZER_PIN = 19;
-const uint8_t SERVO_PIN = 18;
+const uint8_t BUZZER_PIN = 18;
+const uint8_t SERVO_PIN = 19;
 
-const uint8_t BUZZER_LEDC_CHANNEL = 2; // channel ของ ledc สำหรับ buzzer
+const uint8_t BUZZER_LEDC_CHANNEL = 2; // LEDC channel for the buzzer
 
-// ---------------- ตำแหน่ง servo ----------------
+enum class BuzzerType { PASSIVE, ACTIVE };
+const BuzzerType BUZZER_TYPE = BuzzerType::PASSIVE; // Select ACTIVE for an active buzzer
+const uint8_t ACTIVE_BUZZER_ON_LEVEL = HIGH; // Use LOW for an active-low module
+
+// ---------------- Servo positions ----------------
 const uint8_t SERVO_LOCKED = 0;
 const uint8_t SERVO_OPEN = 90;
 Servo lockServo;
@@ -71,7 +76,7 @@ void writeServo(uint8_t angle)
   lockServo.write(angle);
 }
 
-// ---------------- สถานะไฟ LED ----------------
+// ---------------- LED states ----------------
 bool currentRedLed = false;
 bool currentGreenLed = false;
 
@@ -87,32 +92,32 @@ void writeGreen(bool on)
   digitalWrite(GREEN_PIN, on ? HIGH : LOW);
 }
 
-// ---------------- เฉลย (จาก ChallengeKey.csv, one=bit4 ... five=bit0) ----------------
+// ---------------- Answer key (from ChallengeKey.csv, one=bit4 ... five=bit0) ----------------
 const uint8_t NUM_GROUPS = 20;
 const uint8_t ANSWER_KEY[NUM_GROUPS] = {
-    /* 1 */ 20,
-    /* 2 */ 0,
-    /* 3 */ 5,
-    /* 4 */ 17,
-    /* 5 */ 6,
-    /* 6 */ 12,
-    /* 7 */ 3,
-    /* 8 */ 23,
-    /* 9 */ 5,
-    /*10 */ 23,
-    /*11 */ 20,
-    /*12 */ 5,
-    /*13 */ 5,
-    /*14 */ 9,
-    /*15 */ 5,
-    /*16 */ 20,
-    /*17 */ 24,
-    /*18 */ 5,
-    /*19 */ 23,
-    /*20 */ 12,
+    /* 1 */ 4,
+    /* 2 */ 16,
+    /* 3 */ 21,
+    /* 4 */ 1,
+    /* 5 */ 22,
+    /* 6 */ 28,
+    /* 7 */ 19,
+    /* 8 */ 7,
+    /* 9 */ 21,
+    /*10 */ 7,
+    /*11 */ 4,
+    /*12 */ 21,
+    /*13 */ 21,
+    /*14 */ 25,
+    /*15 */ 21,
+    /*16 */ 4,
+    /*17 */ 8,
+    /*18 */ 21,
+    /*19 */ 7,
+    /*20 */ 28,
 };
 
-// ---------------- สถานะเกม (จำกัดให้ตอบผิดได้สูงสุด 3 ครั้ง) ----------------
+// ---------------- Game state (maximum 3 incorrect attempts) ----------------
 const uint8_t MAX_ATTEMPTS = 3;
 
 enum GameState
@@ -127,10 +132,11 @@ GameState state = SETUP;
 uint8_t currentGroup = 0;
 uint8_t expectedCode = 0;
 uint16_t wrongCount = 0;
+unsigned long failedElapsedMs = 0;
 unsigned long roundStartMs = 0;
-unsigned long solvedElapsedMs = 0; // เวลาที่ใช้ ณ ตอนตอบถูก (ไว้แสดงหลัง SOLVED)
+unsigned long solvedElapsedMs = 0; // Elapsed time when solved, retained for display after SOLVED
 
-// ---------------- debounce/long-press ปุ่มยืนยัน ----------------
+// ---------------- Confirm button debounce/long press ----------------
 bool confirmPrevReading = HIGH;
 bool confirmStableState = HIGH;
 unsigned long confirmDebounceAt = 0;
@@ -139,7 +145,7 @@ bool confirmLongFired = false;
 const unsigned long DEBOUNCE_MS = 25;
 const unsigned long LONG_PRESS_MS = 2000;
 
-// ---------------- ไฟกระพริบแบบ non-blocking ----------------
+// ---------------- Non-blocking LED blinking ----------------
 enum BlinkMode
 {
   BLINK_OFF,
@@ -154,7 +160,7 @@ unsigned long blinkLastToggle = 0;
 bool blinkPhase = false;
 uint8_t blinkPulsesLeft = 0;
 
-// ---------------- เสียงแบบ non-blocking (ไม่ใช้ delay() กัน WebServer หน่วง) ----------------
+// ---------------- Non-blocking audio (no delay() to keep the web server responsive) ----------------
 struct Note
 {
   uint16_t freq;
@@ -179,6 +185,12 @@ void startTune(const Note *t, uint8_t len)
 
 void setBuzzerTone(uint16_t freq)
 {
+  if (BUZZER_TYPE == BuzzerType::ACTIVE)
+  {
+    digitalWrite(BUZZER_PIN, freq > 0 ? ACTIVE_BUZZER_ON_LEVEL
+                                    : (ACTIVE_BUZZER_ON_LEVEL == HIGH ? LOW : HIGH));
+    return;
+  }
 #if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
   ledcWriteTone(BUZZER_PIN, freq);
 #else
@@ -207,7 +219,7 @@ void updateTune()
   }
 }
 
-// ---------------- ฟังก์ชันหลักของเกม (โครงเดียวกับเวอร์ชัน Arduino เดิม) ----------------
+// ---------------- Core game functions (same structure as the original Arduino version) ----------------
 void setBlink(BlinkMode mode)
 {
   blinkMode = mode;
@@ -222,10 +234,12 @@ void enterSetup()
   currentGroup = 0;
   expectedCode = 0;
   wrongCount = 0;
-  writeServo(SERVO_OPEN); // ในระหว่าง setup ให้ unlock (เปิดกลอน 90°)
+  writeServo(SERVO_OPEN); // Keep the latch unlocked during setup (90 degrees)
   writeRed(false);
   writeGreen(false);
   setBlink(BLINK_SETUP_ALT);
+  Serial.println("[SETUP] Set group 1-20 on SW1..SW5 (weights 1,2,4,8,16), then tap CONFIRM GPIO33.");
+  Serial.println("[SETUP] All switches OFF = 0 (invalid group). Hold CONFIRM 2 seconds to reset.");
 }
 
 void trySetGroup(uint8_t group)
@@ -237,27 +251,27 @@ void trySetGroup(uint8_t group)
     wrongCount = 0;
     roundStartMs = millis();
     state = PLAYING;
-    writeServo(SERVO_LOCKED); // หลังจากเริ่มกลุ่ม เข้าสู่ stage LOCKED (ล็อคกลอน 0°)
+    writeServo(SERVO_LOCKED); // Lock the latch when a group starts (0 degrees)
     setBlink(BLINK_OFF);
     writeRed(false);
     writeGreen(false);
     startTune(TUNE_CONFIRM, 1);
 
-    Serial.printf("เริ่มกลุ่ม %u (เฉลย = %u) -> LOCKED กลอนล็อคพร้อมเริ่มเล่น (ตอบได้สูงสุด %u ครั้ง)\n",
+    Serial.printf("Starting group %u (answer = %u) -> LOCKED; ready to play (maximum %u attempts)\n",
                   currentGroup, expectedCode, MAX_ATTEMPTS);
   }
   else
   {
     setBlink(BLINK_ERROR_RED);
     startTune(TUNE_ERROR, 3);
-    Serial.printf("เลขกลุ่มไม่ถูกต้อง: %u\n", group);
+    Serial.printf("Invalid group number: %u\n", group);
   }
 }
 
 void submitGuess(uint8_t code)
 {
   if (state != PLAYING)
-    return; // ตอบได้เฉพาะตอน PLAYING เท่านั้น
+    return; // Accept guesses only while PLAYING
 
   unsigned long elapsed = millis() - roundStartMs;
 
@@ -271,7 +285,7 @@ void submitGuess(uint8_t code)
     writeServo(SERVO_OPEN);
     startTune(TUNE_CORRECT, 3);
 
-    Serial.printf("ถูกต้อง! กลุ่ม %u ใช้เวลา %lu วิ ผิด %u ครั้ง\n",
+    Serial.printf("Correct! Group %u finished in %lu seconds with %u incorrect attempts\n",
                   currentGroup, elapsed / 1000, wrongCount);
   }
   else
@@ -280,17 +294,18 @@ void submitGuess(uint8_t code)
     if (wrongCount >= MAX_ATTEMPTS)
     {
       state = FAILED;
+      failedElapsedMs = elapsed;
       writeServo(SERVO_LOCKED);
       setBlink(BLINK_FAILED_RED);
       startTune(TUNE_ERROR, 3);
-      Serial.printf("ผิดครบ %u ครั้ง! กลุ่ม %u ตกรอบ (FAILED) รหัสล่าสุดที่กรอก = %u\n",
+      Serial.printf("Reached %u incorrect attempts! Group %u FAILED; last submitted code = %u\n",
                     MAX_ATTEMPTS, currentGroup, code);
     }
     else
     {
       setBlink(BLINK_WRONG_RED);
       startTune(TUNE_WRONG, 1);
-      Serial.printf("ผิด (ครั้งที่ %u/%u) รหัสที่กรอก = %u\n", wrongCount, MAX_ATTEMPTS, code);
+      Serial.printf("Incorrect (attempt %u/%u); submitted code = %u\n", wrongCount, MAX_ATTEMPTS, code);
     }
   }
 }
@@ -298,7 +313,7 @@ void submitGuess(uint8_t code)
 void onResetRequested()
 {
   enterSetup();
-  Serial.println("รีเซ็ต -> กลับสู่โหมดตั้งเลขกลุ่ม");
+  Serial.println("Reset -> return to group selection mode");
 }
 
 uint8_t readSwitchCode()
@@ -315,10 +330,14 @@ uint8_t readSwitchCode()
 void onConfirmTap()
 {
   uint8_t code = readSwitchCode();
+  Serial.printf("[CONFIRM] Tap: state=%u switch_value=%u\n",
+                static_cast<unsigned>(state), code);
   if (state == SETUP)
-    trySetGroup(code); // สำรอง: ตั้งกลุ่มด้วยสวิตช์ก็ได้
+    trySetGroup(code); // Fallback: select the group using the switches
   else if (state == PLAYING)
     submitGuess(code);
+  else
+    Serial.println("[CONFIRM] Round ended. Hold CONFIRM 2 seconds to return to SETUP first.");
 }
 
 void handleConfirmButton()
@@ -336,10 +355,12 @@ void handleConfirmButton()
     {
       confirmPressedAt = millis();
       confirmLongFired = false;
+      Serial.println("[CONFIRM] GPIO33 pressed (LOW)");
     }
     else
     {
       unsigned long heldMs = millis() - confirmPressedAt;
+      Serial.printf("[CONFIRM] Released after %lu ms\n", heldMs);
       if (!confirmLongFired && heldMs < LONG_PRESS_MS)
         onConfirmTap();
     }
@@ -401,7 +422,7 @@ void updateBlink()
   }
 }
 
-// ---------------- หน้าเว็บ (ฝัง HTML/CSS/JS ไว้ในตัว ไม่ต้องมีอินเทอร์เน็ต) ----------------
+// ---------------- Web page (embedded HTML/CSS/JS; no internet required) ----------------
 const char PAGE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -600,6 +621,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
     <button class="btn-start" onclick="startGroup()">Start Group</button>
   </div>
   <button class="btn-reset" onclick="doReset()">Reset to SETUP</button>
+  <p style="text-align:center"><a href="/play" target="_blank" rel="noopener" style="color:#38bdf8">Open player display ↗</a></p>
   <p id="msg"></p>
 </div>
 
@@ -749,6 +771,36 @@ refresh();
 </script></body></html>
 )HTML";
 
+void handlePlayerStatus()
+{
+  unsigned long elapsedSec = 0;
+  if (state == PLAYING)
+    elapsedSec = (millis() - roundStartMs) / 1000;
+  else if (state == SOLVED)
+    elapsedSec = solvedElapsedMs / 1000;
+  else if (state == FAILED)
+    elapsedSec = failedElapsedMs / 1000;
+
+  const char *stateStr = (state == SETUP) ? "SETUP"
+                         : (state == PLAYING) ? "PLAYING"
+                         : (state == SOLVED) ? "SOLVED" : "FAILED";
+  const uint8_t swCode = readSwitchCode();
+  char buf[220];
+  snprintf(buf, sizeof(buf),
+           "{\"state\":\"%s\",\"group\":%u,\"wrong\":%u,\"max_wrong\":%u,\"elapsed\":%lu,"
+           "\"switches\":[%u,%u,%u,%u,%u]}",
+           stateStr, currentGroup, wrongCount, MAX_ATTEMPTS, elapsedSec,
+           (swCode >> 0) & 1, (swCode >> 1) & 1, (swCode >> 2) & 1,
+           (swCode >> 3) & 1, (swCode >> 4) & 1);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", buf);
+}
+
+void handlePlayer()
+{
+  server.send_P(200, "text/html; charset=utf-8", PLAYER_PAGE_HTML);
+}
+
 void handleRoot()
 {
   server.send_P(200, "text/html", PAGE_HTML);
@@ -767,7 +819,7 @@ void handleStatus()
                          : (state == SOLVED)  ? "SOLVED"
                                               : "FAILED";
 
-  // อ่านสถานะสวิตช์ทั้ง 5 ตัวสดๆ จากขา GPIO
+  // Read the live states of all 5 switches from GPIO
   uint8_t swCode = 0;
   uint8_t sw[5];
   for (uint8_t i = 0; i < 5; i++)
@@ -778,16 +830,16 @@ void handleStatus()
       swCode |= (1 << i);
   }
 
-  // อ่านปุ่มยืนยันสดๆ (กด = LOW)
+  // Read the live confirm button state (pressed = LOW)
   bool confirmPressed = (digitalRead(CONFIRM_PIN) == LOW);
 
-  // ไฟ LED และ เซอร์โว
+  // LEDs and servo
   bool ledRed = currentRedLed;
   bool ledGreen = currentGreenLed;
   uint8_t servoAngle = currentServoAngle;
   const char *servoStr = (servoAngle == SERVO_OPEN) ? "UNLOCKED" : "LOCKED";
 
-  // เฉลยของกลุ่มปัจจุบัน
+  // Answer key for the current group
   uint8_t expCode = (currentGroup >= 1 && currentGroup <= NUM_GROUPS) ? ANSWER_KEY[currentGroup - 1] : 0;
 
   char buf[380];
@@ -809,7 +861,7 @@ void handleStart()
 {
   int g = server.hasArg("group") ? server.arg("group").toInt() : 0;
   bool ok = (g >= 1 && g <= NUM_GROUPS);
-  trySetGroup((uint8_t)g); // ฟังก์ชันเดิมจะกระพริบไฟ error เองถ้าเลขไม่ถูกต้อง
+  trySetGroup((uint8_t)g); // The existing function flashes the error LED for an invalid group number
   char buf[32];
   snprintf(buf, sizeof(buf), "{\"ok\":%s}", ok ? "true" : "false");
   server.send(200, "application/json", buf);
@@ -832,12 +884,21 @@ void setup()
   writeRed(false);
   writeGreen(false);
 
+  if (BUZZER_TYPE == BuzzerType::PASSIVE)
+  {
 #if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-  ledcAttach(BUZZER_PIN, 2000, 8);
+    ledcAttach(BUZZER_PIN, 2000, 8);
 #else
-  ledcSetup(BUZZER_LEDC_CHANNEL, 2000, 8);
-  ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CHANNEL);
+    ledcSetup(BUZZER_LEDC_CHANNEL, 2000, 8);
+    ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CHANNEL);
 #endif
+  }
+  else
+  {
+    digitalWrite(BUZZER_PIN, ACTIVE_BUZZER_ON_LEVEL == HIGH ? LOW : HIGH);
+    pinMode(BUZZER_PIN, OUTPUT);
+  }
+  setBuzzerTone(0);
 
   lockServo.setPeriodHertz(50);
   lockServo.attach(SERVO_PIN, 500, 2400);
@@ -849,18 +910,21 @@ void setup()
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("Access Point: ");
   Serial.println(AP_SSID);
-  Serial.print("รหัสผ่าน: ");
+  Serial.print("Password: ");
   Serial.println(AP_PASS);
-  Serial.print("เปิดเบราว์เซอร์ไปที่: http://");
+  Serial.print("Open a browser at: http://");
   Serial.println(WiFi.softAPIP());
 
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/admin", HTTP_GET, handleRoot);
+  server.on("/play", HTTP_GET, handlePlayer);
+  server.on("/player-status", HTTP_GET, handlePlayerStatus);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/start", HTTP_POST, handleStart);
   server.on("/reset", HTTP_POST, handleReset);
   server.begin();
 
-  Serial.println("เว็บเซิร์ฟเวอร์พร้อมทำงาน");
+  Serial.println("Web server ready");
 }
 
 void loop()
