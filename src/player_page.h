@@ -55,11 +55,11 @@ dialog button:focus-visible{outline:3px solid white;outline-offset:4px}
 <section class="switch-panel" aria-labelledby="switchTitle">
 <h2 id="switchTitle">Current switches</h2>
 <ul class="switches" aria-label="Physical switch states">
-<li id="switch0" class="switch"><span class="switch-name">SW1</span><span class="switch-state">—</span></li>
-<li id="switch1" class="switch"><span class="switch-name">SW2</span><span class="switch-state">—</span></li>
-<li id="switch2" class="switch"><span class="switch-name">SW3</span><span class="switch-state">—</span></li>
-<li id="switch3" class="switch"><span class="switch-name">SW4</span><span class="switch-state">—</span></li>
 <li id="switch4" class="switch"><span class="switch-name">SW5</span><span class="switch-state">—</span></li>
+<li id="switch3" class="switch"><span class="switch-name">SW4</span><span class="switch-state">—</span></li>
+<li id="switch2" class="switch"><span class="switch-name">SW3</span><span class="switch-state">—</span></li>
+<li id="switch1" class="switch"><span class="switch-name">SW2</span><span class="switch-state">—</span></li>
+<li id="switch0" class="switch"><span class="switch-name">SW1</span><span class="switch-state">—</span></li>
 </ul>
 <p id="switchNote" class="switch-note" role="status">Waiting for switch status…</p>
 </section>
@@ -84,7 +84,7 @@ let lastResultKey = null;
 function renderSwitches(switches) {
   const available = Array.isArray(switches) && switches.length === 5;
   const active = [];
-  for (let i = 0; i < 5; i++) {
+  for (let i = 4; i >= 0; i--) {
     const card = el('switch' + i);
     const on = available && switches[i] === 1;
     card.dataset.on = String(on);
